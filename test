@@ -1,0 +1,1012 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Diagnostics;
+using System.IO;
+using NHibernate;
+using BJBS.INFRA.Data;
+using BJBS.DOMAIN.CORPORATIVO.ValueObjects;
+using BJBS.DATA.CORPORATIVO.Repositories;
+using System.Configuration;
+using System.Text;
+using static BCO.JOB.CADASTRO.CARGALOTE.Utils;
+using BCO.CYBERBANK.DATA.Repositories;
+using System.Data.SqlClient;
+using System.Data;
+
+namespace BCO.JOB.CADASTRO.CARGALOTE
+{
+    public class CargaClientes
+    {
+        #region CONSTANTES
+        public const string PROCESS_SUCCESS = "00";
+        public const string PROCESS_SUCCESS_WARNING = "01";
+        public const string PROCESS_ERROR = "02";
+
+        public object statusProcesso = PROCESS_SUCCESS;
+        #endregion
+
+        #region propriedades
+        private ISessionFactory sessionFactory;
+        private PessoaRepositorio repositorio = new PessoaRepositorio();
+        #endregion
+
+        #region Métodos Publicos
+        public CargaClientes()
+        {
+            DataSesssion.Create(typeof(PessoaRepositorio).Assembly);
+            sessionFactory = DataSesssion.SessionFactory;
+        }
+
+        // Processar a leitura do arquivo de entrada e a carga de clientes
+        public bool Processar()
+        {
+            Console.WriteLine(string.Format("{0} - Iniciando carga lote", DateTime.Now.ToString("dd/MM/yyyy HH:mm:ss")));
+
+            var tempo = new Stopwatch();
+            tempo.Start();
+
+            int totalClientesNovos = 0;
+            int totalClientesExistentes = 0;
+            int processline = 2;
+            int countWarning = 0;
+            int totalRegistroProcessado = 0;
+            bool gerouHeader = false;
+
+            ArquivoTexto arquivo = new ArquivoTexto();
+            CyberbankRepositorio repositorioCyber = new CyberbankRepositorio();
+            //List<string> ListaErroPicPay;
+            //List<string> ListaErroConsole;
+
+            List<string> ListaErroConsole = new List<string>();
+            List<string> ListaErroPicPay = new List<string>();
+            List<string> ListaErroConsoleDuplicado = new List<string>();
+            List<string> ListaErroPicPayDuplicado = new List<string>();
+
+            string file_in = ConfigurationManager.AppSettings["ARQUIVOCLIENTES"];
+            string file_process = ConfigurationManager.AppSettings["ARQUIVOPROCESSADO"];
+            string file_cyber = ConfigurationManager.AppSettings["ARQUIVOCYBER"];
+
+            int timeoutConnection;
+            if (!int.TryParse(ConfigurationManager.AppSettings["TIMEOUTPICPAY"], out timeoutConnection))
+                timeoutConnection = 10800; // 3 horas por padrão
+
+            var connection = ConfigurationManager.AppSettings["BJBS.DATA.CORPORATIVO"];
+            if (connection == null)
+            {
+                statusProcesso = PROCESS_ERROR;
+                Console.WriteLine("Não foi encontrada configuração com o seguinte nome: BJBS.DATA.CORPORATIVO");
+            }
+
+            try
+            {
+                if (arquivo.ExisteArquivo('E', file_in, false, false))
+                {
+                    file_in = arquivo.pathArquivo;
+                    Console.WriteLine($"Inicio da carga {file_in}");
+                    arquivo.ExisteArquivo('S', file_process, true, false);
+                    file_process = arquivo.pathArquivo;
+                    arquivo.ExisteArquivo('S', file_cyber, true, false);
+                    file_cyber = arquivo.pathArquivo;
+
+                    //define o nome e tipo do arquivo que esta sendo processado
+                    arquivo.tipoArquivo = "CARGACLIENTES";
+                    arquivo.nomeArquivo = file_in;
+
+                    //Recupera o valor da ultima linha do arquivo de retorno
+                    processline = (GetSeqLastLine(file_process) + 1);
+                    //count no arquivo de retorno                    
+                    totalRegistroProcessado = File.ReadLines(file_process).Count();
+
+                    //gerouHeader = totalRegistroProcessado > 0;
+
+                    Encoding utf8WithoutBom = new UTF8Encoding(false);
+
+                    Console.WriteLine(string.Format("Quantidade Total: {0}", File.ReadLines(file_in).Count()));
+
+                    using (var sr_file_in = new StreamReader(file_in, Encoding.UTF8))
+                    using (var sw_file_process = new StreamWriter(file_process, true, utf8WithoutBom, 4096))
+                    using (var sw_file_cyber = new StreamWriter(file_cyber, true, utf8WithoutBom, 4096))
+                    {
+
+                        List<ArquivoTexto.DetalheCliente> linhaCorrente = new List<ArquivoTexto.DetalheCliente>();
+
+                        List<ArquivoTexto.DetalheCliente> listaClientesNaoDuplicados = new List<ArquivoTexto.DetalheCliente>();
+                        ArquivoTexto.DetalheCliente clienteNaoDuplicado;
+
+
+                        foreach (string line in File.ReadLines(file_in, Encoding.UTF8))
+                        {
+                            clienteNaoDuplicado = new ArquivoTexto.DetalheCliente();
+                            string[] linhas = line.Split(';');
+
+                            if (linhas[0] != "000000001")
+                            {
+                                clienteNaoDuplicado.Sequencia = linhas[0];
+                                clienteNaoDuplicado.Data = linhas[1];
+                                clienteNaoDuplicado.CPF = linhas[2];
+                                clienteNaoDuplicado.NomeCliente = linhas[3];
+                                clienteNaoDuplicado.DDI = linhas[4];
+                                clienteNaoDuplicado.DDD = linhas[5];
+                                clienteNaoDuplicado.Telefone = linhas[6];
+                                clienteNaoDuplicado.Email = linhas[7];
+                                clienteNaoDuplicado.FlagBACEN = linhas[8];
+                                listaClientesNaoDuplicados.Add(clienteNaoDuplicado);
+                            }
+                        }
+
+                        var removeDuplicadosArquivo = listaClientesNaoDuplicados.ToList();
+
+                        var registrosDuplicados = removeDuplicadosArquivo.GroupBy(x => x.CPF).Where(g => g.Count() > 1).Select(cpf => cpf.Key).ToList();
+
+                        var listaCpfRejeitados = new List<ArquivoTexto.DetalheCliente>();
+
+
+
+                        #region VALIDAÇÃO DO ARQUIVO CAD_RET_COMPLETO.TXT CASO NÃO EXISTIR OU ESTIVER VAZIO CRIA O HEADER DO ARQUIVO
+                        if (totalRegistroProcessado == 0)
+                        {
+                            arquivo.header.Set(
+                            Sequencia => "000000001",
+                            Data => listaClientesNaoDuplicados.FirstOrDefault().Data,
+                            Campanha => "picpay");
+                            sw_file_process.WriteLine(arquivo.FieldsToLine1(arquivo.header));
+                            gerouHeader = true;
+                            totalRegistroProcessado++;
+                        }
+                        #endregion VALIDAÇÃO DO ARQUIVO CAD_RET_COMPLETO.TXT CASO NÃO EXISTIR OU ESTIVER VAZIO CRIA O HEADER DO ARQUIVO
+
+                        for (int i = 0; i < removeDuplicadosArquivo.Count; i++)
+                        {
+                            var registro = removeDuplicadosArquivo[i];
+                            var cpfDup = registrosDuplicados.Where(ss => ss == registro.CPF).Count();
+
+                            if (cpfDup > 0)
+                            {
+                                listaCpfRejeitados.Add(registro);
+
+                                if (registro.Sequencia != "000000001")
+                                {
+                                    totalRegistroProcessado++;
+                                    arquivo.detalheProcessadoCliente.Set(
+                                                               Sequencia => totalRegistroProcessado.ToString().PadLeft(9, '0'),
+                                                               CPF => registro.CPF,
+                                                               SequenciaArquivoOriginal => registro.Sequencia,
+                                                               CodigoProcessamento => PROCESS_ERROR + ";" + "E98");
+                                    sw_file_process.WriteLine(arquivo.FieldsToLine1(arquivo.detalheProcessadoCliente));
+                                }
+                            }
+                        }
+
+                        foreach (var registroRejeitado in listaCpfRejeitados)
+                        {
+                            listaClientesNaoDuplicados.Remove(registroRejeitado);
+                            Console.WriteLine("CPF duplicado no arquivo {0}", registroRejeitado.Sequencia);
+                        }
+
+                        //Inicia lendo o cabeçalho do arquivo para não ser consumido no loop
+                        string linhaLida = sr_file_in.ReadLine();
+                        if (linhaLida != null)
+                        {
+                            sw_file_process.AutoFlush = true;
+                            sw_file_cyber.AutoFlush = true;
+
+                            DataTable dt = new DataTable();
+                            dt.Columns.AddRange(
+                                        new DataColumn[11] {
+                                        new DataColumn("NO_DOCUMENTO",typeof(string)),
+                                        new DataColumn("NM_PESSOA",typeof(string)),
+                                        new DataColumn("CD_EXTERNO",typeof(string)),
+                                        new DataColumn("ID_PESSOA", typeof(int)),
+                                        new DataColumn("NO_DDI",typeof(string)),
+                                        new DataColumn("NO_DDD",typeof(string)),
+                                        new DataColumn("NO_TELEFONE",typeof(string)),
+                                        new DataColumn("CD_SEQUENCIA",typeof(string)),
+                                        new DataColumn("DT_PROCESSAMENTO", typeof(DateTime)),
+                                        new DataColumn("IC_PROCESSADO", typeof(bool)),
+                                        new DataColumn("DS_MENSAGEM",typeof(string))
+                                        }
+                                        );
+
+                            using (var session = DataSesssion.OpenSession())
+                            using (var dataAccess = new DataAccess(session, typeof(PessoaRepositorio).Assembly.GetName().Name))
+                            {
+                                repositorio.Data = dataAccess;
+
+                                Console.WriteLine("{0} - Iniciando leitura do arquivo...", DateTime.Now.ToString("dd/MM/yyyy HH:mm:ss"));
+
+                                //linhaCorrente = listaClientesNaoDuplicados;
+
+                                #region Primeiro FOREACH
+                                foreach (var line in listaClientesNaoDuplicados)
+                                {
+                                    #region
+                                    if (!CPF.IsValid(line.CPF))
+                                    {
+                                        ListaErroConsole.Add("\n    E03 - CPF invalido");
+                                        ListaErroPicPay.Add("E03");
+                                    }
+
+                                    #region VALIDA TELEFONE E DDI
+
+                                    if (line.Telefone != "")
+                                    {
+                                        if (line.Telefone.Where(c => char.IsLetter(c)).Count() > 0 || line.Telefone.Count() < 8)
+                                        {
+                                            ListaErroConsole.Add("\n    W03 Telefone Inválido");
+                                            ListaErroPicPay.Add("W03");
+                                        }
+                                    }
+                                    else
+                                    {
+                                        ListaErroConsole.Add("\n    W03 Telefone vazio");
+                                        ListaErroPicPay.Add("W03");
+                                    }
+
+                                    if (line.DDI != "")
+                                    {
+                                        if (line.DDI.Count() > 3)
+                                        {
+                                            ListaErroConsole.Add("\n    W01 - DDI invalido");
+                                            ListaErroPicPay.Add("W01");
+                                        }
+                                    }
+                                    else
+                                    {
+                                        ListaErroConsole.Add("\n    W01 - DDI invalido");
+                                        ListaErroPicPay.Add("W01");
+                                    }
+
+                                    if (line.DDD != "")
+                                    {
+                                        if (line.DDD.Count() > 3)
+                                        {
+                                            ListaErroConsole.Add("\n    W02 - DDD invalido");
+                                            ListaErroPicPay.Add("W02");
+                                        }
+                                    }
+                                    else
+                                    {
+                                        ListaErroConsole.Add("\n    W02 - DDD invalido");
+                                        ListaErroPicPay.Add("W02");
+                                    }
+
+                                    #endregion VALIDA TELEFONE E DDI
+
+                                    if (ListaErroPicPay.Count > 0)
+                                    {
+                                        var ErrosRegistro = "";
+
+                                        foreach (var item in ListaErroPicPay)
+                                        {
+                                            ErrosRegistro = ErrosRegistro + item;
+                                        }
+                                        var ErrosConsole = "";
+
+                                        foreach (var item in ListaErroConsole)
+                                        {
+                                            ErrosConsole = ErrosConsole + item;
+                                        }
+
+                                        Console.WriteLine("\n" + line.Sequencia + " \n  Erro: " + ErrosConsole);
+                                        totalRegistroProcessado++;
+                                        arquivo.detalheProcessadoCliente.Set(
+                                               Sequencia => totalRegistroProcessado.ToString().PadLeft(9, '0'),
+                                               CPF => line.CPF,
+                                               SequenciaArquivoOriginal => line.Sequencia,
+                                               CodigoProcessamento => PROCESS_ERROR + ";" + ErrosRegistro);
+                                        sw_file_process.WriteLine(arquivo.FieldsToLine1(arquivo.detalheProcessadoCliente));
+
+                                        statusProcesso = PROCESS_SUCCESS_WARNING;
+
+                                        countWarning++;
+                                        processline++;
+                                        #endregion
+
+                                        #endregion VALIDA CODIGOS DE ERROS
+                                    }
+                                    else
+                                    {
+                                        dt.Rows.Add();
+
+                                        dt.Rows[dt.Rows.Count - 1]["NO_DOCUMENTO"] = line.CPF;
+                                        dt.Rows[dt.Rows.Count - 1]["NM_PESSOA"] = line.NomeCliente;
+                                        dt.Rows[dt.Rows.Count - 1]["NO_DDI"] = line.DDI;
+                                        dt.Rows[dt.Rows.Count - 1]["NO_DDD"] = line.DDD;
+                                        dt.Rows[dt.Rows.Count - 1]["NO_TELEFONE"] = line.Telefone;
+                                        dt.Rows[dt.Rows.Count - 1]["CD_SEQUENCIA"] = line.Sequencia;
+                                        dt.Rows[dt.Rows.Count - 1]["IC_PROCESSADO"] = 0;
+                                        try
+                                        {
+                                            dt.Rows[dt.Rows.Count - 1]["CD_EXTERNO"] = repositorio.GerarCodigoExterno();
+                                        }
+                                        catch (SqlException ex)
+                                        {
+                                            dt.Rows[dt.Rows.Count - 1]["IC_PROCESSADO"] = 3;
+                                            dt.Rows[dt.Rows.Count - 1]["DS_MENSAGEM"] = ex.Message;
+
+                                            Console.WriteLine("\n ======================================================= \n" +
+                                                              " Message: \n" + line.Sequencia + " - " + ex.Message +
+                                                              "\n ===========================================");
+                                            totalRegistroProcessado++;
+                                            arquivo.detalheProcessadoCliente.Set(Sequencia => totalRegistroProcessado.ToString().PadLeft(9, '0'),
+                                                                       CPF => line.CPF,
+                                                                       SequenciaArquivoOriginal => line.Sequencia,
+                                                                       CodigoProcessamento => PROCESS_ERROR + ";" + "E99");
+                                            statusProcesso = PROCESS_SUCCESS_WARNING;
+                                        }
+                                    }
+                                }
+                                #endregion 
+                                //Limpar o stage por parametro quando houver um grande volume de dados a serem processados
+                                #region LIMPA TABELA
+                                if (dt.Rows.Count > 0)
+                                {
+                                    DominioRepositorio _repositorioDominio = new DominioRepositorio();
+                                    _repositorioDominio.Data = dataAccess;
+
+                                    var dominio = _repositorioDominio.Obter("PARAMETRIZACAO_PICPAY", "1");
+
+                                    if (dominio != null)
+                                    {
+                                        Console.WriteLine("{0} - Encontrado parametrização para limpeza da tabela stage", DateTime.Now.ToString("dd/MM/yyyy HH:mm:ss"));
+
+                                        using (var conn = new SqlConnection(ConfigurationManager.ConnectionStrings[connection].ConnectionString))
+                                        {
+                                            try
+                                            {
+                                                if (conn.State != ConnectionState.Open)
+                                                    conn.Open();
+
+                                                using (var command = new SqlCommand())
+                                                {
+                                                    command.Connection = conn;
+                                                    command.CommandTimeout = timeoutConnection;
+                                                    command.CommandType = CommandType.StoredProcedure;
+                                                    command.CommandText = "CORPP_LIMPA_CARGA_LOTE_PICPAY";
+                                                    command.ExecuteNonQuery();
+                                                }
+                                            }
+                                            catch (SqlException ex)
+                                            {
+                                                StringBuilder errorMessages = new StringBuilder();
+                                                for (int i = 0; i < ex.Errors.Count; i++)
+                                                {
+                                                    errorMessages.Append("\n ======================================================= \n " +
+                                                       " Message: \n " + ex.Errors[i].Message +
+                                                        "\n ===========================================");
+                                                    Console.WriteLine(errorMessages.ToString());
+                                                }
+                                            }
+                                        }
+                                        Console.WriteLine("{0} - Limpeza da tabela stage realizada com sucesso", DateTime.Now.ToString("dd/MM/yyyy HH:mm:ss"));
+                                    }
+                                }
+                            }
+                            #endregion LIMPA TABELA
+
+                            Console.WriteLine(string.Format("{0} - Finalizou leitura do arquivo...", DateTime.Now.ToString("dd/MM/yyyy HH:mm:ss")));
+
+                            if (dt.Rows.Count > 0)
+                            {
+                                try
+                                {
+                                    var retornoProcessamento = new DataSet();
+
+                                    using (var conn = new SqlConnection(ConfigurationManager.ConnectionStrings[connection].ConnectionString))
+                                    {
+                                        if (conn.State != ConnectionState.Open)
+                                            conn.Open();
+
+                                        Console.WriteLine("{0} - Executando rotina de preparação...", DateTime.Now.ToString("dd/MM/yyyy HH:mm:ss"));
+
+                                        using (var command = new SqlCommand())
+                                        {
+
+                                            try
+                                            {
+                                                command.Connection = conn;
+                                                command.CommandTimeout = timeoutConnection;
+                                                command.CommandType = CommandType.StoredProcedure;
+                                                command.CommandText = "CORPP_PREPARA_CARGA_LOTE_PICPAY";
+                                                command.ExecuteNonQuery();
+                                            }
+                                            catch (SqlException ex)
+                                            {
+                                                StringBuilder errorMessages = new StringBuilder();
+
+                                                for (int i = 0; i < ex.Errors.Count; i++)
+                                                {
+                                                    if (ListaErroPicPay.Count > 0)
+                                                    {
+                                                        ListaErroPicPay.Add("E99");
+                                                    }
+                                                    errorMessages.Append("\n ======================================================= \n " +
+                                                       " Message PROCEDURE CORPP_PREPARA_CARGA_LOTE_PICPAY: \n  - " + ex.Errors[i].Message +
+                                                        "\n ===========================================");
+                                                    Console.WriteLine(errorMessages.ToString());
+
+                                                    statusProcesso = PROCESS_ERROR;
+                                                    countWarning++;
+                                                }
+                                            }
+                                        }
+                                        Console.WriteLine("{0} - Carregando tabela stage...", DateTime.Now.ToString("dd/MM/yyyy HH:mm:ss"));
+
+                                        // Descarregar o datatable no banco
+                                        using (SqlBulkCopy sqlBulkCopy = new SqlBulkCopy(conn))
+                                        {
+                                            sqlBulkCopy.DestinationTableName = "CORP_CARGA_LOTE_PICPAY";
+                                            sqlBulkCopy.WriteToServer(dt);
+                                        }
+
+                                        Console.WriteLine("{0} - Executando rotina de carga...", DateTime.Now.ToString("dd/MM/yyyy HH:mm:ss"));
+
+                                        using (var command = new SqlCommand())
+                                        {
+                                            try
+                                            {
+                                                command.Connection = conn;
+                                                command.CommandTimeout = timeoutConnection;
+                                                command.CommandType = CommandType.StoredProcedure;
+                                                command.CommandText = "CORPP_PROCESSAR_CARGA_LOTE_PICPAY";
+                                                var adp = new SqlDataAdapter(command);
+                                                adp.Fill(retornoProcessamento, "CARGA_PICPAY");
+                                            }
+                                            catch (SqlException ex)
+                                            {
+                                                StringBuilder errorMessages = new StringBuilder();
+
+                                                for (int i = 0; i < ex.Errors.Count; i++)
+                                                {
+                                                    errorMessages.Append("\n ======================================================= \n " +
+                                                       " Message PROCEDURE CORPP_PROCESSAR_CARGA_LOTE_PICPAY: \n  - " + ex.Errors[i].Message +
+                                                        "\n ===========================================");
+                                                    Console.WriteLine(errorMessages.ToString());
+
+                                                    statusProcesso = PROCESS_ERROR;
+                                                    countWarning++;
+                                                }
+                                            }
+                                        }
+
+                                        Console.WriteLine("{0} - Finalizou rotina de carga...", DateTime.Now.ToString("dd/MM/yyyy HH:mm:ss"));
+
+                                        if (conn.State == ConnectionState.Open)
+                                            conn.Close();
+                                    }
+
+                                    if (retornoProcessamento.Tables.Count > 0)
+                                    {
+                                        Console.WriteLine("{0} - Gerando arquivo de retorno...", DateTime.Now.ToString("dd/MM/yyyy HH:mm:ss"));
+
+                                        for (int x = 0; x < retornoProcessamento.Tables["CARGA_PICPAY"].Rows.Count; x++)
+                                        {
+                                            DataRow dr = retornoProcessamento.Tables["CARGA_PICPAY"].Rows[x];
+
+                                            var documento = dr["NO_DOCUMENTO"];
+                                            var nome = dr["NM_PESSOA"];
+                                            var ddi = dr["NO_DDI"];
+                                            var ddd = dr["NO_DDD"];
+                                            var telefone = dr["NO_TELEFONE"];
+                                            var sequencia = dr["CD_SEQUENCIA"];
+                                            var processado = dr["IC_PROCESSADO"] != null ? dr["IC_PROCESSADO"].ToString() : string.Empty;
+                                            int codigoCliente;
+                                            int.TryParse(dr["CD_EXTERNO"] != null ? dr["CD_EXTERNO"].ToString() : string.Empty, out codigoCliente);
+
+                                            if (codigoCliente > 0)
+                                            {
+                                                // Se o retorno for igual a 2, indica que a Pessoa já existia no ACAD
+                                                if (processado == "2")
+                                                {
+                                                    if (sequencia.ToString() != "000000001")
+                                                    {
+                                                        totalRegistroProcessado++;
+                                                        //Console.WriteLine("\n" + linhaCorrente.Sequencia + " \n  Erro: " + "Cliente ja esta na base, nada sera alterado");
+                                                        arquivo.detalheProcessadoCliente.Set(
+                                                               Sequencia => totalRegistroProcessado.ToString().PadLeft(9, '0'),
+                                                               CPF => documento,
+                                                               SequenciaArquivoOriginal => sequencia,
+                                                               CodigoProcessamento => PROCESS_ERROR + ";" + "E30");
+                                                        sw_file_process.WriteLine(arquivo.FieldsToLine1(arquivo.detalheProcessadoCliente));
+                                                    }
+
+                                                    statusProcesso = PROCESS_SUCCESS_WARNING;
+
+                                                    countWarning++;
+                                                    totalClientesExistentes++;
+                                                }
+                                                else if (processado == "1")
+                                                {
+                                                    if (sequencia.ToString() != "000000001")
+                                                    {
+                                                        totalRegistroProcessado++;
+                                                        arquivo.detalheProcessadoCliente.Set(
+                                                                  Sequencia => totalRegistroProcessado.ToString().PadLeft(9, '0'),
+                                                                  CPF => documento,
+                                                                  SequenciaArquivoOriginal => sequencia,
+                                                                  CodigoProcessamento => "00");
+                                                        sw_file_process.WriteLine(arquivo.FieldsToLine1(arquivo.detalheProcessadoCliente));
+                                                    }
+
+                                                    totalClientesNovos++;
+                                                }
+
+                                                //MetaExtensions.Set(arquivo.detalheCargaLoteCyberBank,
+                                                arquivo.detalheCargaLoteCyberBank.Set(
+                                                    customerId => codigoCliente.ToString(),
+                                                    personTypeId => "1",
+                                                    identificationTypeCPF => "CPF",
+                                                    IdentificationNumberCPF => documento,
+                                                    name => nome,
+                                                    telephoneType => "CELULAR",
+                                                    telCode => ddi,
+                                                    areaCode => ddd,
+                                                    phoneNumber => telefone,
+                                                    telForComu => "S",
+                                                    status => "NULO",
+                                                    maritalStatus => "99",
+                                                    sexCode => "99",
+                                                    IsentoIR => "N",
+                                                    IsentoIOF => "N",
+                                                    authorizeBacen => "N", // permiteConsultaBacen
+                                                    authorizePcam => "N",
+                                                    statusId => "7",
+                                                    campaign_origination => "PicPay");
+
+                                                sw_file_cyber.WriteLine(arquivo.FieldsToLine(arquivo.detalheCargaLoteCyberBank));
+
+                                                processline++;
+                                            }
+                                        }
+                                    }
+                                }
+                                catch (Exception e)
+                                {
+                                    StringBuilder errorMessages = new StringBuilder();
+
+                                    Console.WriteLine("\n ======================================================= \n "
+                                        + " Message: \n  - " + e.Message.ToString());
+
+                                    statusProcesso = PROCESS_ERROR;
+                                    statusProcesso = PROCESS_ERROR;
+                                    countWarning++;
+                                    Console.WriteLine("398");
+                                    Console.WriteLine(e);
+                                }
+                            }
+                            else
+                            {
+                                statusProcesso = "03";
+                                Console.WriteLine("Não existem linhas para ser processadas.");
+                            }
+                        }
+                        else
+                        {
+                            statusProcesso = "03";
+                            Console.WriteLine("Não existem linhas para ser processadas.");
+                        }
+
+                        if (!gerouHeader)
+                        {
+                            var seq = "000000001";
+                            var dat = DateTime.Now.ToString("yyyyMMdd");
+                            var pic = "picpay";
+
+                            arquivo.header.Set(
+                                                        Sequencia => seq,
+                                                        Data => dat,
+                                                        Campanha => pic);
+                            sw_file_process.WriteLine(arquivo.FieldsToLine1(arquivo.header));
+                        }
+
+                        arquivo.trailler.Data = !string.IsNullOrEmpty(arquivo.header.Data) ? arquivo.header.Data : DateTime.Now.ToString("yyyyMMdd");
+                        arquivo.trailler.Sequencia = "999999999";
+                        arquivo.trailler.Quantidade = (totalRegistroProcessado == 0 ? 2 : totalRegistroProcessado++ + 1).ToString();
+
+                        //arquivo.FinalizarProcessamento(linhaCorrente.Sequencia);
+                        sw_file_process.WriteLine(arquivo.FieldsToLine1(arquivo.trailler));
+                        sw_file_process.Close();
+                        sw_file_cyber.Close();
+                        sr_file_in.Close();
+                    }
+                }
+                else
+                {
+                    statusProcesso = PROCESS_ERROR;
+                    Console.WriteLine("426");
+                    Console.WriteLine($"O arquivo {file_in} não foi localizado!");
+                }
+            }
+            catch (Exception e)
+            {
+                statusProcesso = PROCESS_ERROR;
+                Console.WriteLine("433");
+                Console.WriteLine(e);
+                Console.WriteLine($"Erro no processamento do arquivo {file_in} ==> {e.Message}");
+            }
+            tempo.Stop();
+
+            Console.WriteLine("\nCodigo Retorno: " + statusProcesso.ToString());
+
+            Console.WriteLine("\nTotal de Registros = " + totalRegistroProcessado.ToString());
+            Console.WriteLine("\nTotal de Registros com warning = " + countWarning.ToString());
+
+            Console.WriteLine("\nTotal de Clientes novos = " + totalClientesNovos.ToString());
+            Console.WriteLine("\nTotal de Registros existentes = " + totalClientesExistentes.ToString());
+
+            Console.WriteLine($"O arquivo {file_in} foi processado em {tempo.Elapsed.Hours.ToString()} horas, {tempo.Elapsed.Minutes.ToString()} minutos e {tempo.Elapsed.Seconds.ToString()} segundos");
+            return true;
+        }
+    }
+}
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Diagnostics;
+using System.IO;
+using NHibernate;
+using BJBS.INFRA.Data;
+using BJBS.DATA.CORPORATIVO.Repositories;
+using System.Configuration;
+using System.Text;
+using System.Data.SqlClient;
+using System.Data;
+using System.Globalization;
+
+namespace BCO.JOB.CADASTRO.CARGALOTE
+{
+    class CargaCep
+    {
+        #region CONSTANTES
+        public const string PROCESS_SUCCESS = "00";
+        public const string PROCESS_SUCCESS_WARNING = "01";
+        public const string PROCESS_ERROR = "02";
+
+        public object statusProcesso = PROCESS_SUCCESS;
+        #endregion
+
+        #region MÉTODOS PRIVADOS
+        private string ToXml(List<ArquivoTexto.CargaCep> list)
+        {
+            StringBuilder xml = new StringBuilder("<root>");
+
+            foreach (var line in list)
+            {
+                xml.Append(String.Format("<Cep cep=\"{0}\" tipoLogradouro=\"{1}\" logradouro=\"{2}\" bairro=\"{3}\" municipio=\"{4}\" uf=\"{5}\"/>", line.CEP, line.TIPO, line.LOGRADOURO, line.BAIRRO, line.MUNICIPIO, line.UF));
+            }
+
+            xml.Append("</root>");
+
+            return xml.ToString();
+        }
+
+        #endregion
+
+        #region propriedades
+        private ISessionFactory sessionFactory;
+        #endregion
+
+        #region Métodos Publicos
+        public CargaCep()
+        {
+            DataSesssion.Create(typeof(PessoaRepositorio).Assembly);
+            sessionFactory = DataSesssion.SessionFactory;
+        }
+
+        // Processar a leitura do arquivo de entrada e a carga de clientes
+        public bool Processar()
+        {
+            Console.WriteLine(string.Format("{0} - Iniciando carga lote", DateTime.Now.ToString("dd/MM/yyyy HH:mm:ss")));
+
+            var tempo = new Stopwatch();
+            tempo.Start();
+
+            int totalSucesso = 0;
+            int totalErro = 0;
+            int linhaProcessada = 1;
+
+            ArquivoTexto arquivo = new ArquivoTexto();
+
+            string file_in = ConfigurationManager.AppSettings["ARQUIVOCEP"];
+
+            int timeoutConnection;
+            if (!int.TryParse(ConfigurationManager.AppSettings["TIMEOUTPICPAY"], out timeoutConnection))
+                timeoutConnection = 10800; // 3 horas por padrão
+
+            var connection = ConfigurationManager.AppSettings["BJBS.DATA.CORPORATIVO"];
+
+            if (connection == null)
+            {
+                statusProcesso = PROCESS_ERROR;
+                Console.WriteLine("Não foi encontrada configuração com o seguinte nome: BJBS.DATA.CORPORATIVO");
+            }
+
+            try
+            {
+                if (arquivo.ExisteArquivo('E', file_in, false, false))
+                {
+                    file_in = arquivo.pathArquivo;
+                    Console.WriteLine($"Inicio da carga {file_in}");
+
+                    //define o nome e tipo do arquivo que esta sendo processado
+                    arquivo.tipoArquivo = "CARGACEP";
+                    arquivo.nomeArquivo = file_in;
+
+                    Encoding utf8WithoutBom = new UTF8Encoding(false);
+
+                    Console.WriteLine(string.Format("Quantidade Total: {0}", File.ReadLines(file_in).Count()));
+
+                    ArquivoTexto.CargaCep cep;
+                    List<ArquivoTexto.CargaCep> listCep = new List<ArquivoTexto.CargaCep>();
+                    List<ArquivoTexto.CargaCep> listCepRejeitados = new List<ArquivoTexto.CargaCep>();
+                    List<string> listErros = new List<string>();
+
+                    string _cep;
+                    string _tipo;
+                    string _logradouro;
+                    string _bairro;
+                    string _municipio;
+                    string _uf;
+
+                    using (var sr_file_in = new StreamReader(file_in, Encoding.UTF8))
+                    {
+                        foreach (string line in File.ReadLines(file_in, Encoding.UTF8))
+                        {
+                            linhaProcessada++;
+
+                            string[] linhas = line.Split(';');
+
+                            Boolean permiteGravar = true;
+                            cep = new ArquivoTexto.CargaCep();
+
+                            _cep = string.Empty;
+                            _tipo = string.Empty;
+                            _logradouro = string.Empty;
+                            _bairro = string.Empty;
+                            _municipio = string.Empty;
+                            _uf = string.Empty;
+
+                            _cep = linhas[0].Replace("-", "").Trim();
+                            _tipo = linhas[1].Trim();
+                            _logradouro = linhas[2].Trim();
+                            _bairro = linhas[3].Trim();
+                            _municipio = linhas[4].Trim();
+                            _uf = linhas[5].Trim();
+
+                            if (linhas != null)
+                            {
+                                if (string.IsNullOrEmpty(_cep))
+                                {
+                                    listErros.Add("CEP é obrigatório");
+                                    permiteGravar = false;
+                                }
+                                else if (_cep.Length != 8)
+                                {
+                                    listErros.Add("CEP inválido");
+                                    permiteGravar = false;
+                                }
+
+                                if (!string.IsNullOrEmpty(_logradouro) && _logradouro.Length > 100)
+                                {
+                                    listErros.Add("Tamanho máximo do Logradouro excedido (100)");
+                                    permiteGravar = false;
+                                }
+
+                                if (!string.IsNullOrEmpty(_bairro) && _bairro.Length > 72)
+                                {
+                                    listErros.Add("Tamanho máximo do Bairro excedido (72)");
+                                }
+
+                                if (string.IsNullOrEmpty(_municipio))
+                                {
+                                    listErros.Add("Município é obrigatório");
+                                    permiteGravar = false;
+                                }
+
+                                if (string.IsNullOrEmpty(_uf))
+                                {
+                                    listErros.Add("UF é obrigatório");
+                                    permiteGravar = false;
+                                }
+                                else if (_uf.Length != 2)
+                                {
+                                    listErros.Add("Tamanho máximo da UF excedido (2)");
+                                    permiteGravar = false;
+                                }
+
+                                if (permiteGravar)
+                                {
+                                    cep.CEP = _cep;
+                                    cep.TIPO = _tipo;
+                                    cep.LOGRADOURO = _logradouro;
+                                    cep.BAIRRO = _bairro;
+                                    cep.MUNICIPIO = _municipio;
+                                    cep.UF = _uf;
+                                    cep.COD_PROCESSADO = "0";
+                                    listCep.Add(cep);
+
+                                    totalSucesso++;
+                                }
+                                else
+                                {
+                                    foreach (var item in listErros)
+                                    {
+                                        cep.DS_MENSAGEM = string.Format(cep.DS_MENSAGEM + ", " + item);
+                                    }
+
+                                    cep.CEP = string.Format("Linha processada: {0} - \n {1}", linhaProcessada, cep.DS_MENSAGEM);
+                                    listCepRejeitados.Add(cep);
+
+                                    totalErro++;
+                                }
+                            }
+                        }
+
+                        if (listCep != null)
+                        {
+                            Console.WriteLine(string.Format("{0} - Finalizou leitura do arquivo...", DateTime.Now.ToString("dd/MM/yyyy HH:mm:ss")));
+
+                            if (listCep.Count > 0)
+                            {
+                                try
+                                {
+                                    var retornoProcessamento = new DataSet();
+
+                                    using (var conn = new SqlConnection(ConfigurationManager.ConnectionStrings[connection].ConnectionString))
+                                    {
+                                        if (conn.State != ConnectionState.Open)
+                                            conn.Open();
+
+                                        Console.WriteLine("{0} - Carregando xml stage...", DateTime.Now.ToString("dd/MM/yyyy HH:mm:ss"));
+
+                                        var list = listCep.GroupBy(x => x).Where(g => g.Count() > 1).Select(g => g.Key);
+
+                                        string xml = this.ToXml(listCep);
+
+                                        Console.WriteLine("{0} - Executando rotina de carga...", DateTime.Now.ToString("dd/MM/yyyy HH:mm:ss"));
+
+                                        using (var command = new SqlCommand())
+                                        {
+                                            try
+                                            {
+                                                command.Connection = conn;
+                                                command.CommandTimeout = 3600; // 60 minutos
+                                                command.CommandType = CommandType.StoredProcedure;
+                                                command.CommandText = "CORPP_CARGA_LOTE_CEP";
+                                                command.Parameters.Add("XML_ENTRADA", SqlDbType.Xml).Value = xml;
+                                                var adp = new SqlDataAdapter(command);
+                                                adp.Fill(retornoProcessamento, "CARGA_CEP");
+
+                                                statusProcesso = PROCESS_SUCCESS;
+                                            }
+                                            catch (SqlException ex)
+                                            {
+                                                StringBuilder errorMessages = new StringBuilder();
+
+                                                for (int i = 0; i < ex.Errors.Count; i++)
+                                                {
+                                                    errorMessages.Append("\n ======================================================= \n " +
+                                                       " Message PROCEDURE CORPP_CARGA_LOTE_CEP: \n  - " + ex.Errors[i].Message +
+                                                        "\n ===========================================");
+                                                    Console.WriteLine(errorMessages.ToString());
+
+                                                    statusProcesso = PROCESS_ERROR;
+                                                }
+                                            }
+                                        }
+
+                                        Console.WriteLine("{0} - Finalizou rotina de carga...", DateTime.Now.ToString("dd/MM/yyyy HH:mm:ss"));
+
+                                        if (conn.State == ConnectionState.Open)
+                                            conn.Close();
+                                    }
+
+                                    if (retornoProcessamento.Tables.Count > 0)
+                                    {
+                                        Console.WriteLine("{0} - Gerando retorno...", DateTime.Now.ToString("dd/MM/yyyy HH:mm:ss"));
+
+                                        List<string> enderecoSucesso = new List<string>();
+                                        List<string> enderecoErro = new List<string>();
+
+                                        for (int x = 0; x < retornoProcessamento.Tables["CARGA_CEP"].Rows.Count; x++)
+                                        {
+                                            DataRow dr = retornoProcessamento.Tables["CARGA_CEP"].Rows[x];
+
+                                            string zipCode = dr["NO_CEP"].ToString();
+                                            string type = dr["CD_TIPO_LOGRADOURO"].ToString();
+                                            string street = dr["NM_LOGRADOURO"].ToString();
+                                            string neighborhood = dr["NM_BAIRRO"].ToString();
+                                            string city = dr["NM_MUNICIPIO"].ToString();
+                                            string uf = dr["CD_UNIDADE_FEDERATIVA"].ToString();
+
+                                            string endereco = string.Format("CEP: {0}, Tipo: {1}, Logradouro: {2}, Bairro: {3}, Municipio: {4}, Uf: {5}", zipCode, type, street, neighborhood, city, uf);
+                                            enderecoSucesso.Add(endereco);
+                                        }
+
+                                        foreach (var item in listCepRejeitados)
+                                        {
+                                            statusProcesso = PROCESS_SUCCESS_WARNING;
+                                            string endereco = string.Format(item.CEP);
+                                            enderecoErro.Add(endereco);
+                                        }
+
+                                        if (enderecoSucesso != null && enderecoSucesso.Count > 0)
+                                        {
+                                            Console.WriteLine("\n ===================");
+                                            Console.WriteLine("\n Processado com sucesso");
+                                            foreach (var item in enderecoSucesso)
+                                            {
+                                                Console.WriteLine("{0}", item);
+                                            }
+                                        }
+
+                                        if (enderecoErro != null && enderecoErro.Count > 0)
+                                        {
+                                            Console.WriteLine("\n ===================");
+                                            Console.WriteLine("\n Processado com erro");
+                                            foreach (var item in enderecoErro)
+                                            {
+                                                Console.WriteLine("\n {0}", item);
+                                            }
+                                            statusProcesso = PROCESS_SUCCESS_WARNING;
+                                        }
+                                    }
+                                }
+                                catch (SqlException ex)
+                                {
+                                    statusProcesso = PROCESS_ERROR;
+                                    Console.WriteLine("SqlException: \n: {0}", ex.Message);
+                                    Console.WriteLine("\nCodigo Retorno: " + statusProcesso.ToString());
+                                    return false;
+                                }
+                                catch (Exception ex)
+                                {
+                                    statusProcesso = PROCESS_ERROR;
+                                    Console.WriteLine("Exception: \n: {0}", ex.Message);
+                                    Console.WriteLine("\nCodigo Retorno: " + statusProcesso.ToString());
+                                    return false;
+                                }
+                            }
+                        }
+                        sr_file_in.Close();
+
+                        try
+                        {
+                            File.Delete(file_in);
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine("Exception excluindo arquivo: \n: {0}", ex.Message);
+                        }
+                    }
+                }
+                else
+                {
+                    statusProcesso = PROCESS_SUCCESS_WARNING;
+                    Console.WriteLine("\nNão existe arquivo para ser processado");
+                    Console.WriteLine("\nCodigo Retorno: " + statusProcesso.ToString());
+                    return false;
+                }
+            }
+            catch (Exception ex)
+            {
+                statusProcesso = PROCESS_ERROR;
+                Console.WriteLine("Exception: \n: {0}", ex.Message);
+                Console.WriteLine("\nCodigo Retorno: " + statusProcesso.ToString());
+                return false;
+            }
+
+            tempo.Stop();
+
+            Console.WriteLine("\nTotal de Registros com Sucesso = " + totalSucesso);
+            Console.WriteLine("\nTotal de Registros com Erro = " + totalErro);
+            Console.WriteLine("\nCodigo Retorno: " + statusProcesso.ToString());
+            Console.WriteLine($"O arquivo processado em {tempo.Elapsed.Hours.ToString()} horas, {tempo.Elapsed.Minutes.ToString()} minutos e {tempo.Elapsed.Seconds.ToString()} segundos");
+
+            return true;
+        }
+    }
+}
+#endregion
